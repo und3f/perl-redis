@@ -5,19 +5,23 @@ use strict;
 use Test::More;
 use Test::Exception;
 use Test::Deep;
-use IO::String;
+use IO::Socket::INET;
 use Redis;
-use lib 't/tlib';
-use Test::SpawnRedisServer;
 
-my ($c, $srv) = redis();
-END { $c->() if $c }
+my $lsocket = IO::Socket::INET->new(
+    LocalHost => '127.0.0.1',
+    Proto => 'tcp',
+    Listen => 1
+);
+my $port = $lsocket->sockport;
 
+ok(my $r = Redis->new(server => "127.0.0.1:$port"), 'connected to our test redis-server');
 
-ok(my $r = Redis->new(server => $srv), 'connected to our test redis-server');
+my $socket = $lsocket->accept;
+$lsocket->close;
 
 sub r {
-  $r->{sock} = IO::String->new(join('', map {"$_\r\n"} @_));
+  $socket->send(join('', map {"$_\r\n"} @_));
 }
 
 ## -ERR responses

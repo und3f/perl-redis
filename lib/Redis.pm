@@ -6,10 +6,12 @@ use strict;
 use IO::Socket::INET;
 use IO::Select;
 use IO::Handle;
-use Fcntl qw( O_NONBLOCK F_SETFL );
 use Data::Dumper;
 use Carp qw/confess/;
 use Encode;
+use Protocol::Redis;
+
+use constant CHUNK_SIZE => 131072;
 
 =head1 NAME
 
@@ -97,6 +99,9 @@ sub new {
     PeerAddr => $self->{server},
     Proto    => 'tcp',
   ) || confess("Could not connect to Redis server at $self->{server}: $!");
+
+  $self->{parser} =
+    ($self->{protocol_redis} || 'Protocol::Redis')->new(api => 1);
 
   $self->{is_subscriber} = 0;
   $self->{subscribers}   = {};
@@ -220,11 +225,17 @@ sub wait_for_messages {
   my $s = IO::Select->new;
   $s->add($sock);
 
+  my $parser = $self->{parser};
+
   my $count = 0;
   while ($s->can_read($timeout)) {
-    while (__try_read_sock($sock)) {
-      my @m = $self->__read_response('WAIT_FOR_MESSAGES');
-      $self->__process_pubsub_msg(\@m);
+    my $buf;
+    $sock->recv($buf, CHUNK_SIZE);
+    $parser->parse($buf);
+
+    while (my $message = $parser->get_message) {
+      $self->__process_pubsub_msg(
+        $self->__process_message($message, 'WAIT_FOR_MESSAGES'));
       $count++;
     }
   }
@@ -313,12 +324,11 @@ sub __send_command {
   warn "[SEND] $cmd ", Dumper([@_]) if $deb;
 
   ## Encode command using multi-bulk format
-  my $n_elems = scalar(@_) + 1;
-  my $buf     = "\*$n_elems\r\n";
-  for my $elem ($cmd, @_) {
-    my $bin = $enc ? encode($enc, $elem) : $elem;
-    $buf .= defined($bin) ? '$' . length($bin) . "\r\n$bin\r\n" : "\$-1\r\n";
+  my $elements = [];
+  foreach my $elem ($cmd, @_) {
+    push @$elements, {type => '$', data => $enc ? encode($enc, $elem) : $enc};
   }
+  my $buf = $self->{parser}->encode({type => '*', data => $elements});
 
   ## Send command, take care for partial writes
   warn "[SEND RAW] $buf" if $deb;
@@ -334,144 +344,54 @@ sub __send_command {
 }
 
 sub __read_response {
-  my ($self, $cmd) = @_;
+  my ($self, $cmd, $type_r) = @_;
 
-  confess("Not connected to any server") unless $self->{sock};
+  my $sock = $self->{sock} || confess("Not connected to any server");
 
-  local $/ = "\r\n";
+  my $parser = $self->{parser};
+  my $message;
+  my $data;
 
-  ## no debug => fast path
-  return __read_response_r(@_) unless $self->{debug};
-
-  if (wantarray) {
-    my @r = __read_response_r(@_);
-    warn "[RECV] $cmd ", Dumper(\@r);
-    return @r;
+  while (!($message = $parser->get_message)) {
+    recv($sock, $data, CHUNK_SIZE, 0);
+    $parser->parse($data);
   }
-  else {
-    my $r = __read_response_r(@_);
-    warn "[RECV] $cmd ", Dumper($r);
-    return $r;
-  }
+
+  my $r = $self->__process_message($message, $cmd, $type_r);
+
+  return $r if !ref $r || !wantarray;
+  return @$r if wantarray;
 }
 
-sub __read_response_r {
-  my ($self, $command, $type_r) = @_;
+sub __process_message {
+  my ($self, $message, $command, $type_r) = @_;
 
-  my ($type, $result) = $self->__read_line;
+  my $result = $self->__decode_message($message);
+
+  my $type = $message->{type};
   $$type_r = $type if $type_r;
 
   if ($type eq '-') {
     confess "[$command] $result, ";
   }
-  elsif ($type eq '+') {
-    return $result;
-  }
-  elsif ($type eq '$') {
-    return if $result < 0;
-    return $self->__read_len($result + 2);
-  }
-  elsif ($type eq '*') {
-    return if $result < 0;
 
-    my @list;
-    while ($result--) {
-      push @list, scalar($self->__read_response_r($command));
-    }
-    return @list if wantarray;
-    return \@list;
-  }
-  elsif ($type eq ':') {
-    return $result;
-  }
-  else {
-    confess "unknown answer type: $type ($result), ";
-  }
+  warn "[RECV] $command ", Dumper($result) if $self->{debug};
+
+  return $result;
 }
 
-sub __read_line {
-  my $self = $_[0];
-  my $sock = $self->{sock};
+sub __decode_message {
+  my ($self, $elm) = @_;
+  my $enc  = $self->{encoding};
 
-  my $data = <$sock>;
-  confess("Error while reading from Redis server: $!")
-    unless defined $data;
+  my $data = $elm->{data};
+  if ($elm->{type} ne '*') {
+    return $enc ? decode($enc, $data) : $data;
+  };
 
-  chomp $data;
-  warn "[RECV RAW] '$data'" if $self->{debug};
-
-  my $type = substr($data, 0, 1, '');
-  return ($type, $data) unless $self->{encoding};
-  return ($type, decode($self->{encoding}, $data));
+  return unless $data;
+  return [map {$self->__decode_message($_)} @$data];
 }
-
-sub __read_len {
-  my ($self, $len) = @_;
-
-  my $data;
-  my $offset = 0;
-  while ($len) {
-    my $bytes = read $self->{sock}, $data, $len, $offset;
-    confess("Error while reading from Redis server: $!")
-      unless defined $bytes;
-    confess("Redis server closed connection") unless $bytes;
-
-    $offset += $bytes;
-    $len -= $bytes;
-  }
-
-  chomp $data;
-  warn "[RECV RAW] '$data'" if $self->{debug};
-
-  return $data unless $self->{encoding};
-  return decode($self->{encoding}, $data);
-}
-
-
-#
-# The reason for this code:
-#
-# IO::Select and buffered reads like <$sock> and read() dont mix
-# For example, if I receive two MESSAGE messages (from Redis PubSub),
-# the first read for the first message will probably empty to socket
-# buffer and move the data to the perl IO buffer.
-#
-# This means that IO::Select->can_read will return false (after all
-# the socket buffer is empty) but from the application point of view
-# there is still data to be read and process
-#
-# Hence this code. We try to do a non-blocking read() of 1 byte, and if
-# we succeed, we put it back and signal "yes, Virginia, there is still
-# stuff out there"
-#
-# We could just use sysread and leave the socket buffer with the second
-# message, and then use IO::Select as intended, and previous versions of
-# this code did that (check the git history for this file), but
-# performance suffers, about 20/30% slower, mostly because we do a lot
-# of "read one line", where <$sock> beats the crap of anything you can
-# write on Perl-land.
-#
-sub __try_read_sock {
-  my $sock = shift;
-  my $data;
-
-  __fh_nonblocking($sock, 1);
-  my $result = read($sock, $data, 1);
-  __fh_nonblocking($sock, 0);
-
-  return unless $result;
-  $sock->ungetc(ord($data));
-  return 1;
-}
-
-
-### Copied from AnyEvent::Util
-BEGIN {
-  *__fh_nonblocking = ($^O eq 'MSWin32')
-    ? sub($$) { ioctl $_[0], 0x8004667e, pack "L", $_[1]; }    # FIONBIO
-    : sub($$) { fcntl $_[0], F_SETFL, $_[1] ? O_NONBLOCK : 0; };
-}
-
 
 1;
 
